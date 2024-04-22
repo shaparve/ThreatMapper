@@ -1,132 +1,194 @@
-package dockerhub
+package console_diagnosis //nolint:stylecheck
 
 import (
-	"bytes"
+	"archive/tar"
+	"archive/zip"
 	"context"
-	"encoding/json"
-	"net/http"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
-	"github.com/deepfence/ThreatMapper/deepfence_server/model"
-	"github.com/deepfence/ThreatMapper/deepfence_utils/encryption"
-	"github.com/deepfence/ThreatMapper/deepfence_utils/log"
+	"github.com/deepfence/ThreatMapper/deepfence_server/diagnosis"
+	"github.com/deepfence/ThreatMapper/deepfence_utils/directory"
 	"github.com/deepfence/ThreatMapper/deepfence_utils/telemetry"
-	"github.com/go-playground/validator/v10"
+	"github.com/deepfence/ThreatMapper/deepfence_utils/utils"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/filters"
+	dockerClient "github.com/docker/docker/client"
+	"github.com/minio/minio-go/v7"
+	"github.com/rs/zerolog/log"
 )
 
-const dockerHubURL = "https://hub.docker.com/v2"
-
-func New(requestByte []byte) (*RegistryDockerHub, error) {
-	r := RegistryDockerHub{}
-	err := json.Unmarshal(requestByte, &r)
-	if err != nil {
-		return &r, err
-	}
-	return &r, nil
+type DockerConsoleDiagnosisHandler struct {
+	dockerCli *dockerClient.Client
 }
 
-func (d *RegistryDockerHub) ValidateFields(v *validator.Validate) error {
-	err := v.Struct(d)
-	if (err != nil) || d.NonSecret.IsPublic == "true" {
+func NewDockerConsoleDiagnosisHandler() (*DockerConsoleDiagnosisHandler, error) {
+	var err error
+	dockerCli, err := dockerClient.NewClientWithOpts(dockerClient.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, err
+	}
+	return &DockerConsoleDiagnosisHandler{dockerCli: dockerCli}, nil
+}
+
+func (d *DockerConsoleDiagnosisHandler) GenerateDiagnosticLogs(ctx context.Context, tail string) error {
+
+	ctx, span := telemetry.NewSpan(ctx, "diagnosis", "generate-diagnostic-logs-docker")
+	defer span.End()
+
+	zipFile, err := os.Create(fmt.Sprintf("/tmp/deepfence-console-logs-%s.zip", time.Now().Format("2006-01-02-15-04-05")))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		zipFile.Close()
+		os.RemoveAll(zipFile.Name())
+	}()
+	zipWriter := zip.NewWriter(zipFile)
+
+	containerFilters := filters.NewArgs()
+	containers := d.getContainers(ctx, types.ContainerListOptions{
+		Filters: containerFilters,
+		All:     true,
+	})
+
+	logOptions := types.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       tail,
+	}
+
+	for _, container := range containers {
+		err = d.addContainerLogs(ctx, &container, logOptions, zipWriter)
+		if err != nil {
+			log.Warn().Msg(err.Error())
+		}
+	}
+	err = zipWriter.Close()
+	if err != nil {
+		return err
+	}
+	zipWriter.Flush()
+
+	mc, err := directory.FileServerClient(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = mc.UploadLocalFile(ctx,
+		filepath.Join(diagnosis.ConsoleDiagnosisFileServerPrefix, filepath.Base(zipFile.Name())),
+		zipFile.Name(),
+		true,
+		minio.PutObjectOptions{ContentType: "application/zip"})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *DockerConsoleDiagnosisHandler) addContainerLogs(ctx context.Context, container *types.Container, logOptions types.ContainerLogsOptions, zipWriter *zip.Writer) error {
+
+	ctx, span := telemetry.NewSpan(ctx, "diagnosis", "add-container-logs")
+	defer span.End()
+
+	if len(container.Names) == 0 {
+		return nil
+	}
+	containerName := strings.Trim(container.Names[0], "/")
+	logs, err := d.getContainerLogs(ctx, container.ID, logOptions)
+	if err != nil {
+		return err
+	}
+	logBytes, err := io.ReadAll(logs)
+	if err != nil {
+		logs.Close()
+		return err
+	}
+	logs.Close()
+	zipFileWriter, err := zipWriter.Create(fmt.Sprintf("%s.log", containerName))
+	if err != nil {
+		return err
+	}
+	if _, err := zipFileWriter.Write(utils.StripAnsi(logBytes)); err != nil {
+		return err
+	}
+	if strings.Contains(containerName, "router") {
+		err = d.CopyFromContainer(ctx, container.ID, containerName, HaproxyLogsPath, zipWriter)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *DockerConsoleDiagnosisHandler) getContainerLogs(ctx context.Context, containerID string, options types.ContainerLogsOptions) (io.ReadCloser, error) {
+	ctx, span := telemetry.NewSpan(ctx, "diagnosis", "get-container-logs")
+	defer span.End()
+
+	logs, err := d.dockerCli.ContainerLogs(ctx, containerID, options)
+	if err != nil {
+		return nil, err
+	}
+	return logs, nil
+}
+
+func (d *DockerConsoleDiagnosisHandler) getContainers(ctx context.Context, options types.ContainerListOptions) []types.Container {
+	ctx, span := telemetry.NewSpan(ctx, "diagnosis", "get-containers")
+	defer span.End()
+
+	containers, err := d.dockerCli.ContainerList(ctx, options)
+	if err != nil {
+		panic(err)
+	}
+	return containers
+}
+
+func (d *DockerConsoleDiagnosisHandler) CopyFromContainer(ctx context.Context, containerID string, containerName string, srcPath string, zipWriter *zip.Writer) error {
+	ctx, span := telemetry.NewSpan(ctx, "diagnosis", "copy-from-container")
+	defer span.End()
+
+	tarStream, _, err := d.dockerCli.CopyFromContainer(ctx, containerID, srcPath)
+	if err != nil {
 		return err
 	}
 
-	type AuthInfo struct {
-		DockerHubUsername string `json:"docker_hub_username" validate:"required,min=2"`
-		DockerHubPassword string `json:"docker_hub_password" validate:"required,min=2"`
-	}
-
-	auth := AuthInfo{}
-	auth.DockerHubUsername = d.NonSecret.DockerHubUsername
-	auth.DockerHubPassword = d.Secret.DockerHubPassword
-	return v.Struct(auth)
-}
-
-func (d *RegistryDockerHub) IsValidCredential() bool {
-	if d.NonSecret.DockerHubUsername == "" {
-		return d.NonSecret.IsPublic == "true"
-	}
-
-	jsonData := map[string]interface{}{"username": d.NonSecret.DockerHubUsername, "password": d.Secret.DockerHubPassword}
-
-	jsonValue, err := json.Marshal(jsonData)
+	_, err = zipWriter.Create(containerName + "/")
 	if err != nil {
-		log.Error().Msg(err.Error())
-		return false
+		return err
 	}
 
-	req, err := http.NewRequest("POST", dockerHubURL+"/users/login/", bytes.NewBuffer(jsonValue))
-	if err != nil {
-		log.Error().Msg(err.Error())
-		return false
+	tr := tar.NewReader(tarStream)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break // end of tar archive
+		}
+		if err != nil {
+			return err
+		}
+		if hdr.FileInfo().IsDir() {
+			_, err = zipWriter.Create(containerName + "/" + hdr.Name + "/")
+			if err != nil {
+				return err
+			}
+			continue
+		}
+
+		logBytes, err := io.ReadAll(tr)
+		if err != nil {
+			return err
+		}
+
+		zipFileWriter, err := zipWriter.Create(containerName + "/" + hdr.Name)
+		if err != nil {
+			return err
+		}
+		if _, err := zipFileWriter.Write(utils.StripAnsi(logBytes)); err != nil {
+			return err
+		}
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Error().Msg(err.Error())
-		return false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Error().Msgf("failed to authenticate, response: %+v", resp)
-	}
-
-	return resp.StatusCode == http.StatusOK
-}
-
-func (d *RegistryDockerHub) EncryptSecret(aes encryption.AES) error {
-	var err error
-	d.Secret.DockerHubPassword, err = aes.Encrypt(d.Secret.DockerHubPassword)
-	return err
-}
-
-func (d *RegistryDockerHub) DecryptSecret(aes encryption.AES) error {
-	var err error
-	d.Secret.DockerHubPassword, err = aes.Decrypt(d.Secret.DockerHubPassword)
-	return err
-}
-
-func (d *RegistryDockerHub) EncryptExtras(aes encryption.AES) error {
 	return nil
-}
-
-func (d *RegistryDockerHub) DecryptExtras(aes encryption.AES) error {
-	return nil
-}
-
-func (d *RegistryDockerHub) FetchImagesFromRegistry(ctx context.Context) ([]model.IngestedContainerImage, error) {
-	_, span := telemetry.NewSpan(ctx, "registry", "fetch-images-from-registry")
-	defer span.End()
-	return getImagesList(d.NonSecret.DockerHubUsername, d.Secret.DockerHubPassword, d.NonSecret.DockerHubNamespace)
-}
-
-// getters
-func (d *RegistryDockerHub) GetSecret() map[string]interface{} {
-	var secret map[string]interface{}
-	b, err := json.Marshal(d.Secret)
-	if err != nil {
-		log.Error().Msg(err.Error())
-	}
-	err = json.Unmarshal(b, &secret)
-	if err != nil {
-		log.Error().Msg(err.Error())
-	}
-	return secret
-}
-
-func (d *RegistryDockerHub) GetExtras() map[string]interface{} {
-	return map[string]interface{}{}
-}
-
-func (d *RegistryDockerHub) GetNamespace() string {
-	return d.NonSecret.DockerHubNamespace
-}
-
-func (d *RegistryDockerHub) GetRegistryType() string {
-	return d.RegistryType
-}
-
-func (d *RegistryDockerHub) GetUsername() string {
-	return d.NonSecret.DockerHubUsername
 }

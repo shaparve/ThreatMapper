@@ -1,32 +1,16 @@
-package directory
+package model
 
 import (
-	"context"
-	"sync"
-
-	postgresqlDb "github.com/deepfence/ThreatMapper/deepfence_utils/postgresql/postgresql-db"
-	"github.com/minio/minio-go/v7"
-	"github.com/redis/go-redis/v9"
+	"strings"
 )
 
-func getClient[T *redis.Client | *CypherDriver | *postgresqlDb.Queries | *minio.Client | *asynqClients](ctx context.Context, pool *sync.Map, newClientFN func(DBConfigs) (T, error)) (T, error) {
-	key, err := ExtractNamespace(ctx)
-	if err != nil {
-		return nil, err
+func DigestToID(digest string) (string, string) {
+	imageID := strings.TrimPrefix(digest, "sha256:")
+	var shortImageID string
+	if len(imageID) > 12 {
+		shortImageID = imageID[:12]
+	} else {
+		shortImageID = imageID
 	}
-
-	val, has := pool.Load(key)
-	if has {
-		return val.(T), nil
-	}
-
-	directory.RLock()
-	namespace := directory.Directory[key]
-	directory.RUnlock()
-	client, err := newClientFN(namespace)
-	if err != nil {
-		return nil, err
-	}
-	newClient, _ := pool.LoadOrStore(key, client)
-	return newClient.(T), nil
+	return imageID, shortImageID
 }

@@ -1,121 +1,39 @@
-package cronjobs
+package model
 
 import (
-	"context"
-	"time"
-
-	"github.com/deepfence/ThreatMapper/deepfence_utils/directory"
-	"github.com/deepfence/ThreatMapper/deepfence_utils/log"
-	"github.com/deepfence/ThreatMapper/deepfence_utils/telemetry"
 	"github.com/deepfence/ThreatMapper/deepfence_utils/utils"
-	"github.com/hibiken/asynq"
-	"github.com/minio/minio-go/v7"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
 
-const minioReportsPrefix = "/report/"
-
-func CleanUpReports(ctx context.Context, task *asynq.Task) error {
-
-	log := log.WithCtx(ctx)
-
-	log.Info().Msg("Start reports cleanup")
-
-	mc, err := directory.FileServerClient(ctx)
-	if err != nil {
-		return err
-	}
-
-	client, err := directory.Neo4jClient(ctx)
-	if err != nil {
-		log.Error().Msg(err.Error())
-		return nil
-	}
-
-	session := client.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
-	if err != nil {
-		log.Error().Msg(err.Error())
-		return nil
-	}
-	defer session.Close(ctx)
-
-	hoursAgo := time.Now().Add(time.Duration(-utils.ReportRetentionTime))
-
-	cleanup := func(pathPrefix string) {
-		objects := mc.ListFiles(ctx, pathPrefix, false, 0, true)
-		for _, obj := range objects {
-			if obj.LastModified.Before(hoursAgo) {
-				log.Info().Msgf("remove report %s", obj.Key)
-				if err := deleteReport(ctx, session, obj.Key); err != nil {
-					log.Error().Err(err).Msgf("failed to remove report node from neo4j %s", obj.Key)
-				}
-				if err := mc.DeleteFile(ctx, obj.Key, false, minio.RemoveObjectOptions{ForceDelete: true}); err != nil {
-					log.Error().Err(err).Msgf("failed to remove report file from minio %s", obj.Key)
-				}
-			}
-		}
-	}
-
-	cleanup(minioReportsPrefix)
-
-	// delete the reports which are in failed state
-	err = deleteFailedReports(ctx, session)
-
-	log.Info().Msg("Complete reports cleanup")
-
-	return err
+type GenerateReportReq struct {
+	ReportType    string              `json:"report_type" validate:"required" required:"true" enum:"pdf,xlsx,sbom"`
+	FromTimestamp int64               `json:"from_timestamp"` // timestamp in milliseconds
+	ToTimestamp   int64               `json:"to_timestamp"`   // timestamp in milliseconds
+	Filters       utils.ReportFilters `json:"filters"`
+	Options       utils.ReportOptions `json:"options" validate:"omitempty"`
 }
 
-func deleteReport(ctx context.Context, session neo4j.SessionWithContext, path string) error {
-
-	log := log.WithCtx(ctx)
-
-	ctx, span := telemetry.NewSpan(ctx, "cronjobs", "delete-report")
-	defer span.End()
-
-	tx, err := session.BeginTransaction(ctx, neo4j.WithTxTimeout(10*time.Second))
-	if err != nil {
-		log.Error().Msg(err.Error())
-		return err
-	}
-	defer tx.Close(ctx)
-
-	query := `MATCH (n:Report{storage_path:$path}) DELETE n`
-	vars := map[string]interface{}{"path": path}
-	_, err = tx.Run(ctx, query, vars)
-	if err != nil {
-		log.Error().Msg(err.Error())
-		return err
-	}
-
-	return tx.Commit(ctx)
+type GenerateReportResp struct {
+	ReportID string `json:"report_id"`
 }
 
-func deleteFailedReports(ctx context.Context, session neo4j.SessionWithContext) error {
+type ReportReq struct {
+	ReportID string `json:"report_id" path:"report_id" validate:"required" required:"true"`
+}
 
-	log := log.WithCtx(ctx)
+type BulkDeleteReportReq struct {
+	ReportIDs []string `json:"report_ids" required:"true"`
+}
 
-	ctx, span := telemetry.NewSpan(ctx, "cronjobs", "delete-failed-reports")
-	defer span.End()
-
-	tx, err := session.BeginTransaction(ctx, neo4j.WithTxTimeout(10*time.Second))
-	if err != nil {
-		log.Error().Msg(err.Error())
-		return err
-	}
-	defer tx.Close(ctx)
-
-	duration := utils.ReportRetentionTime.Milliseconds()
-
-	query := `MATCH (n:Report) where TIMESTAMP()-n.created_at > $duration DELETE n`
-	vars := map[string]interface{}{
-		"duration": duration,
-	}
-	_, err = tx.Run(ctx, query, vars)
-	if err != nil {
-		log.Error().Msg(err.Error())
-		return err
-	}
-
-	return tx.Commit(ctx)
+type ExportReport struct {
+	UpdatedAt     int64  `json:"updated_at"`
+	ReportID      string `json:"report_id"`
+	CreatedAt     int64  `json:"created_at"`
+	Filters       string `json:"filters"`
+	Type          string `json:"type"`
+	URL           string `json:"url"`
+	FileName      string `json:"-"`
+	Status        string `json:"status"`
+	StoragePath   string `json:"storage_path"`
+	FromTimestamp int64  `json:"from_timestamp"` // timestamp in milliseconds
+	ToTimestamp   int64  `json:"to_timestamp"`   // timestamp in milliseconds
 }
