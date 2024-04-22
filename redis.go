@@ -1,26 +1,29 @@
-package cronjobs
+package directory
 
 import (
 	"context"
+	"sync"
 
-	"github.com/deepfence/ThreatMapper/deepfence_utils/directory"
-	"github.com/deepfence/ThreatMapper/deepfence_utils/log"
-	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 )
 
-func RedisRewriteAOF(ctx context.Context, task *asynq.Task) error {
+var redisClientsPool sync.Map
 
-	log := log.WithCtx(ctx)
+func init() {
+	redisClientsPool = sync.Map{}
+}
 
-	rdb, err := directory.RedisClient(ctx)
-	if err != nil {
-		log.Error().Msg(err.Error())
-		return err
+func newRedisClient(endpoints DBConfigs) (*redis.Client, error) {
+	redisOptions := &redis.Options{
+		Addr: endpoints.Redis.Endpoint,
+		DB:   endpoints.Redis.Database,
 	}
-	err = rdb.BgRewriteAOF(ctx).Err()
-	if err != nil {
-		log.Error().Msg(err.Error())
-		return err
+	if endpoints.Redis.Password != "" {
+		redisOptions.Password = endpoints.Redis.Password
 	}
-	return nil
+	return redis.NewClient(redisOptions), nil
+}
+
+func RedisClient(ctx context.Context) (*redis.Client, error) {
+	return getClient(ctx, &redisClientsPool, newRedisClient)
 }

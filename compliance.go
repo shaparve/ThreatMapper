@@ -1,67 +1,70 @@
 package ingesters
 
-import (
-	"context"
-	"time"
-
-	"github.com/deepfence/ThreatMapper/deepfence_utils/directory"
-	"github.com/deepfence/ThreatMapper/deepfence_utils/telemetry"
-	"github.com/deepfence/ThreatMapper/deepfence_utils/utils"
-	ingestersUtil "github.com/deepfence/ThreatMapper/deepfence_utils/utils/ingesters"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
-)
-
-func CommitFuncCompliance(ctx context.Context, ns string, data []ingestersUtil.Compliance) error {
-	ctx = directory.ContextWithNameSpace(ctx, directory.NamespaceID(ns))
-
-	ctx, span := telemetry.NewSpan(ctx, "ingesters", "commit-func-compliance")
-	defer span.End()
-
-	driver, err := directory.Neo4jClient(ctx)
-	if err != nil {
-		return err
-	}
-
-	session := driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
-	defer session.Close(ctx)
-
-	tx, err := session.BeginTransaction(ctx, neo4j.WithTxTimeout(30*time.Second))
-	if err != nil {
-		return err
-	}
-	defer tx.Close(ctx)
-
-	if _, err = tx.Run(ctx, `
-		UNWIND $batch as row WITH row.rule as rule, row.data as data, row.scan_id as scan_id
-		MERGE (n:Compliance{node_id:data.node_id})
-		MERGE (r:ComplianceRule{node_id:rule.test_number})
-		MERGE (n) -[:IS]-> (r)
-		SET n += data,
-		    n.masked = COALESCE(n.masked, false),
-		    n.updated_at = TIMESTAMP(),
-	        r += rule,
-		    r.masked = COALESCE(r.masked, false),
-		    r.updated_at = TIMESTAMP()
-		WITH n, scan_id
-		MERGE (m:ComplianceScan{node_id: scan_id})
-		MERGE (m) -[l:DETECTED]-> (n)
-		SET l.masked = false`,
-		map[string]interface{}{"batch": CompliancesToMaps(data)}); err != nil {
-		return err
-	}
-
-	return tx.Commit(ctx)
+type ComplianceScanStatus struct {
+	ScanID      string `json:"scan_id"`
+	ScanStatus  string `json:"scan_status"`
+	ScanMessage string `json:"scan_message"`
 }
 
-func CompliancesToMaps(ms []ingestersUtil.Compliance) []map[string]interface{} {
-	res := []map[string]interface{}{}
-	for _, v := range ms {
-		data, rule := v.Split()
-		res = append(res, map[string]interface{}{
-			"rule":    utils.ToMap(rule),
-			"data":    utils.ToMap(data),
-			"scan_id": v.ScanID,
-		})
-	}
-	return res
+type Compliance struct {
+	Type                string `json:"type"`
+	TestCategory        string `json:"test_category"`
+	TestNumber          string `json:"test_number"`
+	TestInfo            string `json:"description"`
+	RemediationScript   string `json:"remediation_script,omitempty"`
+	RemediationAnsible  string `json:"remediation_ansible,omitempty"`
+	RemediationPuppet   string `json:"remediation_puppet,omitempty"`
+	Resource            string `json:"resource"`
+	TestRationale       string `json:"test_rationale"`
+	TestSeverity        string `json:"test_severity"`
+	TestDesc            string `json:"test_desc"`
+	Status              string `json:"status"`
+	ComplianceCheckType string `json:"compliance_check_type"`
+	ScanID              string `json:"scan_id"`
+	NodeID              string `json:"node_id"`
+	NodeType            string `json:"node_type"`
+}
+
+type ComplianceData struct {
+	Type                string `json:"type"`
+	RemediationScript   string `json:"remediation_script,omitempty"`
+	RemediationAnsible  string `json:"remediation_ansible,omitempty"`
+	RemediationPuppet   string `json:"remediation_puppet,omitempty"`
+	Resource            string `json:"resource"`
+	TestSeverity        string `json:"test_severity"`
+	Status              string `json:"status"`
+	ComplianceCheckType string `json:"compliance_check_type"`
+	NodeID              string `json:"node_id"`
+	NodeType            string `json:"node_type"`
+}
+
+type ComplianceRule struct {
+	TestCategory  string `json:"test_category"`
+	TestNumber    string `json:"test_number"`
+	TestInfo      string `json:"description"`
+	TestRationale string `json:"test_rationale"`
+	TestSeverity  string `json:"test_severity"`
+	TestDesc      string `json:"test_desc"`
+}
+
+func (c Compliance) Split() (ComplianceData, ComplianceRule) {
+	return ComplianceData{
+			Type:                c.Type,
+			RemediationScript:   c.RemediationScript,
+			RemediationAnsible:  c.RemediationAnsible,
+			RemediationPuppet:   c.RemediationPuppet,
+			Resource:            c.Resource,
+			TestSeverity:        c.TestSeverity,
+			Status:              c.Status,
+			ComplianceCheckType: c.ComplianceCheckType,
+			NodeID:              c.NodeID,
+			NodeType:            c.NodeType,
+		}, ComplianceRule{
+			TestCategory:  c.TestCategory,
+			TestNumber:    c.TestNumber,
+			TestInfo:      c.TestInfo,
+			TestRationale: c.TestRationale,
+			TestSeverity:  c.TestSeverity,
+			TestDesc:      c.TestDesc,
+		}
 }

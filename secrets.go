@@ -1,93 +1,120 @@
-package ingesters
+package threatintel
 
 import (
 	"context"
 	"fmt"
-	"time"
+	"strings"
 
 	"github.com/deepfence/ThreatMapper/deepfence_utils/directory"
+	"github.com/deepfence/ThreatMapper/deepfence_utils/log"
 	"github.com/deepfence/ThreatMapper/deepfence_utils/telemetry"
-	"github.com/deepfence/ThreatMapper/deepfence_utils/utils"
-	ingestersUtil "github.com/deepfence/ThreatMapper/deepfence_utils/utils/ingesters"
+	"github.com/jellydator/ttlcache/v3"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
 
-func CommitFuncSecrets(ctx context.Context, ns string, data []ingestersUtil.Secret) error {
-	ctx = directory.ContextWithNameSpace(ctx, directory.NamespaceID(ns))
+const (
+	SecretsRulesStore = "secrets"
+)
 
-	ctx, span := telemetry.NewSpan(ctx, "ingesters", "commit-func-secrets")
+func DownloadSecretsRules(ctx context.Context, entry Entry) error {
+
+	log.Info().Msg("download latest secrets rules")
+
+	ctx, span := telemetry.NewSpan(ctx, "threatintel", "download-secrets-rules")
 	defer span.End()
 
-	driver, err := directory.Neo4jClient(ctx)
+	// remove old rule file
+	existing, _, err := FetchSecretsRulesInfo(ctx)
 	if err != nil {
+		log.Error().Err(err).Msg("no existing secret rules info found")
+	} else {
+		if err := DeleteFileMinio(ctx, existing); err != nil {
+			log.Error().Err(err).Msgf("failed to delete file %s", existing)
+		}
+	}
+
+	// download latest rules and uplaod to minio
+	content, err := downloadFile(ctx, entry.URL)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to download secrets rules")
 		return err
 	}
 
-	session := driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
-	defer session.Close(ctx)
+	path, sha, err := UploadToMinio(ctx, content.Bytes(),
+		SecretsRulesStore, fmt.Sprintf("secrets-rules-%d.tar.gz", entry.Built.Unix()))
+	if err != nil {
+		log.Error().Err(err).Msg("failed to uplaod secrets rules to fileserver")
+		return err
+	}
 
-	tx, err := session.BeginTransaction(ctx, neo4j.WithTxTimeout(30*time.Second))
+	// create node in neo4j
+	return UpdateSecretsRulesInfo(ctx, sha, strings.TrimPrefix(path, "database/"))
+}
+
+func UpdateSecretsRulesInfo(ctx context.Context, hash, path string) error {
+	nc, err := directory.Neo4jClient(ctx)
 	if err != nil {
 		return err
+	}
+	session := nc.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err = session.Run(ctx, `
+		MERGE (n:SecretsRules{node_id: "latest"})
+		SET n.rules_hash=$hash,
+			n.path=$path,
+			n.updated_at=TIMESTAMP()`,
+		map[string]interface{}{
+			"hash": hash,
+			"path": path,
+		})
+	if err != nil {
+		log.Error().Err(err).Msg("failed to update SecretsRules on neo4j")
+		return err
+	}
+
+	return nil
+}
+
+func FetchSecretsRulesURL(ctx context.Context, consoleURL string, ttlCache *ttlcache.Cache[string, string]) (string, string, error) {
+	path, hash, err := FetchSecretsRulesInfo(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	exposedURL, err := ExposeFile(ctx, path, consoleURL, ttlCache)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to expose secrets rules on fileserver")
+		return "", "", err
+	}
+	return exposedURL, hash, nil
+}
+
+func FetchSecretsRulesInfo(ctx context.Context) (path, hash string, err error) {
+	nc, err := directory.Neo4jClient(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	session := nc.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	tx, err := session.BeginTransaction(ctx)
+	if err != nil {
+		return "", "", err
 	}
 	defer tx.Close(ctx)
 
-	dataMap, err := secretsToMaps(data)
+	querySecretsRules := `
+	MATCH (s:SecretsRules{node_id: "latest"})
+	RETURN s.path, s.rules_hash`
+
+	r, err := tx.Run(ctx, querySecretsRules, map[string]interface{}{})
 	if err != nil {
-		return err
+		return "", "", err
+	}
+	rec, err := r.Single(ctx)
+	if err != nil {
+		return "", "", err
 	}
 
-	if _, err = tx.Run(ctx, `
-		UNWIND $batch as row WITH row.Rule as rule, row.Secret as secret
-		MERGE (r:SecretRule{rule_id:rule.rule_id})
-		SET r+=rule,
-		    r.masked = COALESCE(r.masked, false),
-		    r.updated_at = TIMESTAMP()
-		WITH secret as row, r
-		MERGE (n:Secret{node_id:row.node_id})
-		SET n+= row, 
-			n.masked = COALESCE(n.masked, r.masked, false),
-			n.updated_at = TIMESTAMP()
-		WITH n, r, row
-		MERGE (n)-[:IS]->(r)
-		MERGE (m:SecretScan{node_id: row.scan_id})
-		WITH n, m
-		MERGE (m) -[l:DETECTED]-> (n)
-		SET l.masked = COALESCE(n.masked, false)`,
-		map[string]interface{}{"batch": dataMap}); err != nil {
-		return err
-	}
-
-	return tx.Commit(ctx)
-}
-
-func secretsToMaps(data []ingestersUtil.Secret) ([]map[string]map[string]interface{}, error) {
-
-	var secrets []map[string]map[string]interface{}
-	for _, i := range data {
-		secret := utils.ToMap(i)
-		delete(secret, "Severity")
-		delete(secret, "Rule")
-		delete(secret, "Match")
-
-		for k, v := range utils.ToMap(i.Severity) {
-			secret[k] = v
-		}
-
-		for k, v := range utils.ToMap(i.Match) {
-			secret[k] = v
-		}
-
-		secret["node_id"] = utils.ScanIDReplacer.Replace(fmt.Sprintf("%v:%v",
-			i.Rule.ID, i.Match.FullFilename))
-		rule := utils.ToMap(i.Rule)
-		delete(rule, "id")
-		rule["rule_id"] = i.Rule.ID
-		rule["level"] = i.Severity.Level
-		secrets = append(secrets, map[string]map[string]interface{}{
-			"Rule":   rule,
-			"Secret": secret,
-		})
-	}
-	return secrets, nil
+	return rec.Values[0].(string), rec.Values[1].(string), nil
 }

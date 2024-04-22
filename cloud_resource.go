@@ -1,241 +1,189 @@
 package ingesters
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"time"
-
-	"github.com/deepfence/ThreatMapper/deepfence_utils/directory"
-	"github.com/deepfence/ThreatMapper/deepfence_utils/log"
-	"github.com/deepfence/ThreatMapper/deepfence_utils/telemetry"
-	ingestersUtil "github.com/deepfence/ThreatMapper/deepfence_utils/utils/ingesters"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+	"strings"
 )
 
-const (
-	NodeTypeHost              = "host"
-	NodeTypeKubernetesCluster = "kubernetes_cluster"
-	Ec2DnsSuffix              = ".compute.amazonaws.com"
-	AwsEc2ResourceId          = "aws_ec2_instance"
-	GcpComputeResourceId      = "gcp_compute_instance"
-	AzureComputeResourceId    = "azure_compute_virtual_machine"
+var (
+	TopologyCloudResourceTypes = []string{
+		// AWS specific types
+		"aws_ec2_instance", "aws_eks_cluster", "aws_s3_bucket", "aws_lambda_function",
+		"aws_ecs_task", "aws_ecs_cluster", "aws_ecr_repository", "aws_ecrpublic_repository",
+		"aws_ecs_task", "aws_rds_db_instance", "aws_rds_db_cluster", "aws_ec2_application_load_balancer",
+		"aws_ec2_classic_load_balancer", "aws_ec2_network_load_balancer",
+		// GCP specific types
+		"gcp_compute_instance", "gcp_sql_database_instance", "gcp_storage_bucket", "gcp_compute_disk",
+		// Azure specific types
+		"azure_compute_virtual_machine", "azure_app_service_function_app", "azure_storage_queue",
+		"azure_storage_table", "azure_storage_container",
+	}
 )
 
-func CommitFuncCloudResource(ctx context.Context, ns string, cs []ingestersUtil.CloudResource) error {
-
-	ctx = directory.ContextWithNameSpace(ctx, directory.NamespaceID(ns))
-
-	ctx, span := telemetry.NewSpan(ctx, "ingesters", "commit-func-cloud-resource")
-	defer span.End()
-
-	driver, err := directory.Neo4jClient(ctx)
-	if err != nil {
-		return err
-	}
-
-	session := driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
-	defer session.Close(ctx)
-
-	batch, hosts, clusters := ResourceToMaps(cs)
-
-	start := time.Now()
-
-	tx, err := session.BeginTransaction(ctx, neo4j.WithTxTimeout(30*time.Second))
-	if err != nil {
-		return err
-	}
-	defer tx.Close(ctx)
-
-	// Add everything
-	_, err = tx.Run(ctx, `
-		UNWIND $batch as row
-		WITH row, row.node_type IN $shown_types as show
-		MERGE (n:CloudResource{node_id:row.node_id})
-		SET n+=row, n.updated_at = TIMESTAMP(), n.active = true, n.linked = false, n.is_shown = show`,
-		map[string]interface{}{
-			"batch":       batch,
-			"shown_types": ingestersUtil.TopologyCloudResourceTypes,
-		},
-	)
-	if err != nil {
-		return err
-	}
-
-	if len(hosts) > 0 {
-		if _, err = tx.Run(ctx, `
-		UNWIND $batch as row
-		OPTIONAL MATCH (n:Node{node_id:row.node_id})
-		WITH n, row as row
-		WHERE n IS NULL or n.active=false
-		MERGE (m:Node{node_id:row.node_id})
-		SET m+=row, m.updated_at = TIMESTAMP()`,
-			map[string]interface{}{"batch": hosts}); err != nil {
-			return err
-		}
-	}
-
-	if len(clusters) > 0 {
-		if _, err = tx.Run(ctx, `
-		UNWIND $batch as row
-		OPTIONAL MATCH (n:KubernetesCluster{node_id:row.node_id})
-		WITH n, row as row
-		WHERE n IS NULL or n.active=false
-		MERGE (m:KubernetesCluster{node_id:row.node_id})
-		SET m+=row, m.updated_at = TIMESTAMP()`,
-			map[string]interface{}{"batch": clusters}); err != nil {
-			return err
-		}
-
-		if _, err := tx.Run(ctx, `
-		MATCH (k:KubernetesCluster)
-		WHERE not (k) -[:INSTANCIATE]-> (:Node)
-		MATCH (n:Node{kubernetes_cluster_id:k.kubernetes_cluster_id})
-		MERGE (k) -[:INSTANCIATE]-> (n)`,
-			map[string]interface{}{}); err != nil {
-			return err
-		}
-	}
-
-	log.Debug().Ctx(ctx).Msgf("cloud resource ingest took: %v", time.Since(start))
-
-	return tx.Commit(ctx)
+type CloudResource struct {
+	AccountID                      string           `json:"account_id"`
+	Arn                            string           `json:"arn"`
+	BlockPublicAcls                bool             `json:"block_public_acls,omitempty"`
+	BlockPublicPolicy              bool             `json:"block_public_policy,omitempty"`
+	BucketPolicyIsPublic           bool             `json:"bucket_policy_is_public,omitempty"`
+	CloudProvider                  string           `json:"cloud_provider,omitempty"`
+	ClusterArn                     string           `json:"cluster_arn,omitempty"`
+	ClusterName                    string           `json:"cluster_name,omitempty"`
+	RestrictPublicBuckets          bool             `json:"restrict_public_buckets,omitempty"`
+	ID                             string           `json:"id"`
+	IgnorePublicAcls               bool             `json:"ignore_public_acls,omitempty"`
+	Name                           string           `json:"name"`
+	HostName                       string           `json:"host_name"`
+	Region                         string           `json:"region"`
+	ResourceID                     string           `json:"resource_id"`
+	IsEgress                       bool             `json:"is_egress"`
+	InstanceID                     string           `json:"instance_id"`
+	NetworkMode                    string           `json:"network_mode,omitempty"`
+	Scheme                         string           `json:"scheme,omitempty"`
+	DDClusterIDentifier            string           `json:"db_cluster_identifier,omitempty"`
+	Connectivity                   string           `json:"connectivity,omitempty"`
+	Group                          string           `json:"group,omitempty"`
+	ServiceName                    string           `json:"service_name,omitempty"`
+	TaskArn                        string           `json:"task_arn,omitempty"`
+	TaskDefinitionArn              string           `json:"task_definition_arn,omitempty"`
+	LastStatus                     string           `json:"last_status"`
+	VpcID                          string           `json:"vpc_id,omitempty"`
+	AllowBlobPublicAccess          bool             `json:"allow_blob_public_access,omitempty"`
+	PublicAccess                   string           `json:"public_access,omitempty"`
+	GroupID                        string           `json:"group_id,omitempty"`
+	CidrIpv4                       string           `json:"cidr_ipv4,omitempty"`
+	PublicNetworkAccess            string           `json:"public_network_access,omitempty"`
+	StorageAccountName             string           `json:"storage_account_name,omitempty"`
+	IamInstanceProfileArn          string           `json:"iam_instance_profile_arn,omitempty"`
+	IamInstanceProfileID           string           `json:"iam_instance_profile_id,omitempty"`
+	PublicIPAddress                string           `json:"public_ip_address"`
+	PrivateIPAddress               string           `json:"private_ip_address,omitempty"`
+	InstanceType                   string           `json:"instance_type,omitempty"`
+	PrivateDNSName                 string           `json:"private_dns_name,omitempty"`
+	Tags                           *json.RawMessage `json:"tags,omitempty"`
+	PolicyStd                      *json.RawMessage `json:"policy_std,omitempty"`
+	Containers                     *json.RawMessage `json:"containers,omitempty"`
+	TaskDefinition                 *json.RawMessage `json:"task_definition,omitempty"`
+	VpcOptions                     *json.RawMessage `json:"vpc_options,omitempty"`
+	Policy                         *json.RawMessage `json:"policy,omitempty"`
+	PublicIps                      *json.RawMessage `json:"public_ips,omitempty"`
+	NetworkInterfaces              *json.RawMessage `json:"network_interfaces,omitempty"`
+	IamPolicy                      *json.RawMessage `json:"iam_policy,omitempty"`
+	IPConfiguration                *json.RawMessage `json:"ip_configuration,omitempty"`
+	IngressSettings                string           `json:"ingress_settings,omitempty"`
+	SecurityGroups                 *json.RawMessage `json:"security_groups,omitempty"`
+	VpcSecurityGroups              *json.RawMessage `json:"vpc_security_groups,omitempty"`
+	ContainerDefinitions           *json.RawMessage `json:"container_definitions,omitempty"`
+	EventNotificationConfiguration *json.RawMessage `json:"event_notification_configuration,omitempty"`
+	ResourceVpcConfig              *json.RawMessage `json:"resource_vpc_config,omitempty"`
+	NetworkConfiguration           *json.RawMessage `json:"network_configuration,omitempty"`
+	AttachedPolicyArns             *json.RawMessage `json:"attached_policy_arns"`
+	CreateDate                     string           `json:"create_date,omitempty"`
+	Groups                         *json.RawMessage `json:"groups"`
+	InlinePolicies                 *json.RawMessage `json:"inline_policies"`
+	Path                           string           `json:"path"`
+	UserID                         string           `json:"user_id"`
+	AccessLevel                    string           `json:"access_level"`
+	Action                         string           `json:"action"`
+	Description                    string           `json:"description"`
+	Privilege                      string           `json:"privilege"`
+	OrganizationID                 string           `json:"organization_id"`
+	OrganizationMasterAccountArn   string           `json:"organization_master_account_arn"`
+	OrganizationMasterAccountEmail string           `json:"organization_master_account_email"`
+	TargetHealthDescriptions       *json.RawMessage `json:"target_health_descriptions"`
+	InstanceProfileArns            *json.RawMessage `json:"instance_profile_arns"`
+	Instances                      *json.RawMessage `json:"instances"`
+	TargetGroupArn                 string           `json:"target_group_arn"`
+	VpcSecurityGroupIDs            *json.RawMessage `json:"vpc_security_group_ids"`
+	Users                          *json.RawMessage `json:"users"`
+	UserGroups                     *json.RawMessage `json:"user-groups"`
+	ResourcesVpcConfig             *json.RawMessage `json:"resources_vpc_config"`
 }
 
-func ResourceToMaps(ms []ingestersUtil.CloudResource) ([]map[string]interface{}, []map[string]interface{}, []map[string]interface{}) {
-	res := make([]map[string]interface{}, 0, len(ms))
-	hosts := make([]map[string]interface{}, 0)
-	clusters := make([]map[string]interface{}, 0)
-	timestampNow := time.Now().UTC().Format(time.RFC3339Nano)
-	for _, v := range ms {
-		newmap, err := v.ToMap()
-		if err != nil {
-			log.Error().Msgf("ToMap err:%v", err)
-			continue
-		}
-		res = append(res, newmap)
+func (c *CloudResource) ToMap() (map[string]interface{}, error) {
+	out, err := json.Marshal(*c)
+	if err != nil {
+		return nil, err
+	}
+	bb := map[string]interface{}{}
+	err = json.Unmarshal(out, &bb)
+	if err != nil {
+		return nil, err
+	}
 
-		if v.ResourceID == AwsEc2ResourceId || v.ResourceID == GcpComputeResourceId || v.ResourceID == AzureComputeResourceId {
-			var publicIP, privateIP []string
-			if v.PublicIPAddress != "" {
-				publicIP = []string{v.PublicIPAddress}
-			}
-			if v.PrivateIPAddress != "" {
-				privateIP = []string{v.PrivateIPAddress}
-			}
-			var k8sClusterName string
-			var tags map[string]interface{}
-			if v.Tags != nil {
-				err = json.Unmarshal(*v.Tags, &tags)
-				if err == nil {
-					if clusterName, ok := tags["eks:cluster-name"]; ok {
-						k8sClusterName = fmt.Sprintf("%v", clusterName)
-					} else if clusterName, ok = tags["goog-k8s-cluster-name"]; ok {
-						k8sClusterName = fmt.Sprintf("%v", clusterName)
-					}
-				}
-			}
-			// Add hosts as regular `Node`
-			hosts = append(hosts, map[string]interface{}{
-				"public_ip":               publicIP,
-				"cloud_region":            newmap["cloud_region"],
-				"kubernetes_cluster_name": k8sClusterName,
-				"private_ip":              privateIP,
-				"node_type":               NodeTypeHost,
-				"pseudo":                  false,
-				"timestamp":               timestampNow,
-				"kubernetes_cluster_id":   k8sClusterName,
-				"node_name":               v.Name,
-				"active":                  true,
-				"cloud_provider":          v.CloudProvider,
-				"agent_running":           false,
-				"version":                 "",
-				"instance_id":             newmap["node_id"],
-				"host_name":               v.Name,
-				"node_id":                 v.Name,
-				"account_id":              newmap["account_id"],
-			})
-			if k8sClusterName != "" {
-				clusters = append(clusters, map[string]interface{}{
-					"timestamp":               timestampNow,
-					"node_id":                 k8sClusterName,
-					"node_name":               k8sClusterName,
-					"node_type":               NodeTypeKubernetesCluster,
-					"kubernetes_cluster_name": k8sClusterName,
-					"kubernetes_cluster_id":   k8sClusterName,
-					"active":                  true,
-					"cloud_provider":          v.CloudProvider,
-					"agent_running":           false,
-					"account_id":              newmap["account_id"],
-				})
-			}
+	bb = convertStructFieldToJSONString(bb, "task_definition")
+	bb = convertStructFieldToJSONString(bb, "vpc_options")
+	bb = convertStructFieldToJSONString(bb, "policy")
+	bb = convertStructFieldToJSONString(bb, "public_ips")
+	bb = convertStructFieldToJSONString(bb, "network_interfaces")
+	bb = convertStructFieldToJSONString(bb, "iam_policy")
+	bb = convertStructFieldToJSONString(bb, "ip_configuration")
+	bb = convertStructFieldToJSONString(bb, "security_groups")
+	bb = convertStructFieldToJSONString(bb, "vpc_security_groups")
+	bb = convertStructFieldToJSONString(bb, "container_definitions")
+	bb = convertStructFieldToJSONString(bb, "event_notification_configuration")
+	bb = convertStructFieldToJSONString(bb, "resource_vpc_config")
+	bb = convertStructFieldToJSONString(bb, "network_configuration")
+	bb = convertStructFieldToJSONString(bb, "policy_std")
+	bb = convertStructFieldToJSONString(bb, "attached_policy_arns")
+	bb = convertStructFieldToJSONString(bb, "groups")
+	bb = convertStructFieldToJSONString(bb, "inline_policies")
+	bb = convertStructFieldToJSONString(bb, "instances")
+	bb = convertStructFieldToJSONString(bb, "containers")
+	bb = convertStructFieldToJSONString(bb, "target_health_descriptions")
+	bb = convertStructFieldToJSONString(bb, "instance_profile_arns")
+	bb = convertStructFieldToJSONString(bb, "users")
+	bb = convertStructFieldToJSONString(bb, "user-groups")
+	bb = convertStructFieldToJSONString(bb, "vpc_security_group_ids")
+	bb = convertStructFieldToJSONString(bb, "resources_vpc_config")
+	bb = convertStructFieldToJSONString(bb, "tags")
+
+	if strings.Contains(bb["resource_id"].(string), "azure") {
+		if bb["resource_id"].(string) == "azure_compute_virtual_machine" {
+			bb["node_id"] = bb["vm_id"]
+		} else {
+			bb["node_id"] = bb["name"]
+		}
+	} else {
+		switch {
+		case bb["arn"] != nil:
+			bb["node_id"] = bb["arn"]
+		case bb["id"] != nil:
+			bb["node_id"] = bb["id"]
+		case bb["resource_id"] != nil:
+			bb["node_id"] = bb["resource_id"]
+		default:
+			bb["node_id"] = "error"
 		}
 	}
-	return res, hosts, clusters
+	accountID, present := bb["account_id"]
+	if present {
+		splits := strings.Split(fmt.Sprintf("%v", accountID), "-")
+		if len(splits) > 2 {
+			bb["cloud_provider"] = splits[2]
+		}
+	}
+
+	bb["node_type"] = bb["resource_id"]
+	cloudRegion := "global"
+	if v, has := bb["region"]; has && v != nil {
+		cloudRegion = v.(string)
+	}
+	bb["cloud_region"] = cloudRegion
+	bb["node_name"] = bb["name"]
+
+	return bb, nil
 }
 
-// TODO: Call somewhere
-func LinkNodesWithCloudResources(ctx context.Context) error {
-	driver, err := directory.Neo4jClient(ctx)
-	if err != nil {
-		return err
+func convertStructFieldToJSONString(bb map[string]interface{}, key string) map[string]interface{} {
+	if val, ok := bb[key]; ok && val != nil {
+		v, e := json.Marshal(val)
+		if e == nil {
+			bb[key] = string(v)
+		} else {
+			bb[key] = "error"
+		}
 	}
-
-	session := driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
-	defer session.Close(ctx)
-
-	tx, err := session.BeginTransaction(ctx, neo4j.WithTxTimeout(30*time.Second))
-	if err != nil {
-		return err
-	}
-	defer tx.Close(ctx)
-
-	if _, err = tx.Run(ctx, `
-		MATCH (n:Node) -[r:IS]-> (m:CloudResource)
-		DELETE r`,
-		map[string]interface{}{}); err != nil {
-		log.Error().Msgf("error: %+v", err)
-		return err
-	}
-
-	if _, err = tx.Run(ctx, `
-		MATCH (n:Node)
-		WITH apoc.convert.fromJsonMap(n.cloud_metadata) as map, n
-		WHERE map.label = 'AWS'
-		WITH map.id as id, n
-		MATCH (m:CloudResource)
-		WHERE m.node_type = 'aws_ec2_instance'
-		AND m.instance_id = id
-		MERGE (n) -[:IS]-> (m)`, map[string]interface{}{}); err != nil {
-		log.Error().Msgf("error: %+v", err)
-		return err
-	}
-
-	if _, err = tx.Run(ctx, `
-		MATCH (n:Node)
-		WITH apoc.convert.fromJsonMap(n.cloud_metadata) as map, n
-		WHERE map.label = 'GCP'
-		WITH map.hostname as hostname, n
-		MATCH (m:CloudResource)
-		WHERE m.node_type = 'gcp_compute_instance'
-		AND m.hostname = hostname
-		MERGE (n) -[:IS]-> (m)`, map[string]interface{}{}); err != nil {
-		log.Error().Msgf("error: %+v", err)
-		return err
-	}
-
-	if _, err = tx.Run(ctx, `
-		MATCH (n:Node)
-		WITH apoc.convert.fromJsonMap(n.cloud_metadata) as map, n
-		WHERE map.label = 'AZURE'
-		WITH map.vmId as vm, n
-		MATCH (m:CloudResource)
-		WHERE m.node_type = 'azure_compute_virtual_machine'
-		AND m.arn = vm
-		MERGE (n) -[:IS]-> (m)`, map[string]interface{}{}); err != nil {
-		log.Error().Msgf("error: %+v", err)
-		return err
-	}
-
-	return tx.Commit(ctx)
+	return bb
 }
