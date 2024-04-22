@@ -1,4 +1,4 @@
-package utils
+package constants
 
 import (
 	"fmt"
@@ -14,10 +14,7 @@ var (
 )
 
 func init() {
-	if len(Version) > 0 && Version[0] != 'v' {
-		Version = fmt.Sprintf("v%s", Version)
-	}
-	if !semver.IsValid(Version) {
-		log.Fatal().Msgf("Provided console version %s is not valid", Version)
+	if !semver.IsValid(fmt.Sprintf("v%s", Version)) {
+		log.Warn().Msgf("Provided console version %s is not valid", Version)
 	}
 }

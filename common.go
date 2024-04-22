@@ -1,76 +1,74 @@
-package reporters
+package common
 
 import (
-	"errors"
+	"fmt"
+	"strings"
 
-	"github.com/deepfence/ThreatMapper/deepfence_utils/utils"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+	"github.com/deepfence/ThreatMapper/deepfence_server/model"
 )
 
-var (
-	ErrNotFound        = errors.New("resource not found")
-	ScanResultMaskNode = map[utils.Neo4jScanType]string{
-		utils.NEO4JVulnerabilityScan:   "VulnerabilityStub",
-		utils.NEO4JSecretScan:          "Secret",
-		utils.NEO4JMalwareScan:         "Malware",
-		utils.NEO4JComplianceScan:      "Compliance",
-		utils.NEO4JCloudComplianceScan: "CloudCompliance",
-	}
-	ScanResultIDField = map[utils.Neo4jScanType]string{
-		utils.NEO4JVulnerabilityScan:   "cve_id",
-		utils.NEO4JSecretScan:          "node_id",
-		utils.NEO4JMalwareScan:         "node_id",
-		utils.NEO4JComplianceScan:      "node_id",
-		utils.NEO4JCloudComplianceScan: "node_id",
-	}
-)
+type GenerativeAiIntegrationCommon struct{}
 
-type Cypherable interface {
-	NodeType() string
-	ExtendedField() string
+func (g *GenerativeAiIntegrationCommon) GenerateCloudPostureQuery(request model.GenerativeAiIntegrationRequest) (string, error) {
+	var query string
+	if request.GetQueryType() == model.QueryTypeRemediation {
+		req := request.GetFields().(model.GenerativeAiIntegrationCloudPostureRequest)
+		query = fmt.Sprintf(cloudPostureRemediationQuery, GetRemediationFormat(req.RemediationFormat), req.CloudProvider, req.ComplianceCheckType, req.Title)
+		query = strings.TrimSpace(query)
+	}
+	return query, nil
 }
 
-type CypherableAndCategorizable interface {
-	Categorizable
-	Cypherable
+func (g *GenerativeAiIntegrationCommon) GenerateLinuxPostureQuery(request model.GenerativeAiIntegrationRequest) (string, error) {
+	var query string
+	if request.GetQueryType() == model.QueryTypeRemediation {
+		req := request.GetFields().(model.GenerativeAiIntegrationLinuxPostureRequest)
+		query = fmt.Sprintf(linuxPostureRemediationQuery, GetRemediationFormat(req.RemediationFormat), req.ComplianceCheckType, req.TestNumber, req.Description)
+		query = strings.TrimSpace(query)
+	}
+	return query, nil
 }
 
-type Categorizable interface {
-	GetCategory() string
-	GetJSONCategory() string
+func (g *GenerativeAiIntegrationCommon) GenerateKubernetesPostureQuery(request model.GenerativeAiIntegrationRequest) (string, error) {
+	var query string
+	if request.GetQueryType() == model.QueryTypeRemediation {
+		req := request.GetFields().(model.GenerativeAiIntegrationKubernetesPostureRequest)
+		query = fmt.Sprintf(kubernetesPostureRemediationQuery, GetRemediationFormat(req.RemediationFormat), req.ComplianceCheckType, req.Description)
+		query = strings.TrimSpace(query)
+	}
+	return query, nil
 }
 
-func GetCategoryCounts[T Categorizable](entries []T) map[string]int32 {
-	res := map[string]int32{}
-
-	if len(entries) == 0 {
-		return res
+func (g *GenerativeAiIntegrationCommon) GenerateVulnerabilityQuery(request model.GenerativeAiIntegrationRequest) (string, error) {
+	var query string
+	if request.GetQueryType() == model.QueryTypeRemediation {
+		req := request.GetFields().(model.GenerativeAiIntegrationVulnerabilityRequest)
+		packageName := ""
+		if req.CveCausedByPackage != "" {
+			packageName = "in package " + req.CveCausedByPackage
+		}
+		query = fmt.Sprintf(vulnerabilityRemediationQuery, GetRemediationFormat(req.RemediationFormat), req.CveID, packageName)
+		query = strings.TrimSpace(query)
 	}
-
-	if entries[0].GetCategory() == "" {
-		return res
-	}
-
-	for i := range entries {
-		res[entries[i].GetCategory()] += 1
-	}
-
-	return res
+	return query, nil
 }
 
-func Neo4jGetStringRecord(rec *neo4j.Record, key, defaultVal string) string {
-	val, ok := rec.Get(key)
-	if ok && val != nil {
-		return val.(string)
+func (g *GenerativeAiIntegrationCommon) GenerateSecretQuery(request model.GenerativeAiIntegrationRequest) (string, error) {
+	var query string
+	if request.GetQueryType() == model.QueryTypeRemediation {
+		req := request.GetFields().(model.GenerativeAiIntegrationSecretRequest)
+		query = fmt.Sprintf(secretRemediationQuery, req.Name)
+		query = strings.TrimSpace(query)
 	}
-	return defaultVal
+	return query, nil
 }
 
-func Neo4jGetSliceRecord(rec *neo4j.Record, key string, defaultVal []interface{}) []interface{} {
-	val, ok := rec.Get(key)
-	if ok && val != nil {
-		return val.([]interface{})
-	} else {
-		return defaultVal
+func (g *GenerativeAiIntegrationCommon) GenerateMalwareQuery(request model.GenerativeAiIntegrationRequest) (string, error) {
+	var query string
+	if request.GetQueryType() == model.QueryTypeRemediation {
+		req := request.GetFields().(model.GenerativeAiIntegrationMalwareRequest)
+		query = fmt.Sprintf(malwareRemediationQuery, req.RuleName, req.Info)
+		query = strings.TrimSpace(query)
 	}
+	return query, nil
 }

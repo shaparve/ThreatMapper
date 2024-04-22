@@ -1,192 +1,114 @@
-package main
+package router
 
 import (
+	reporters_search "github.com/deepfence/ThreatMapper/deepfence_server/reporters/search"
 	"github.com/deepfence/ThreatMapper/deepfence_utils/directory"
 	"github.com/deepfence/ThreatMapper/deepfence_utils/log"
-	"github.com/deepfence/ThreatMapper/deepfence_worker/cronjobs"
-	"github.com/deepfence/ThreatMapper/deepfence_worker/processors"
-	"github.com/hibiken/asynq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
-func NewMetrics(mode string) *prometheus.Registry {
-	registry := prometheus.NewRegistry()
-	// Add go runtime metrics and process collectors.
-	registry.MustRegister(
-		collectors.NewGoCollector(),
-		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-	)
-
-	//  register prometheus metrics collectors
-	switch mode {
-	case "ingester":
-		registry.MustRegister(processors.CommitNeo4jRecordsCounts, processors.KafkaTopicsLag)
-	case "worker":
-		registry.MustRegister(newWorkerCollector(), cronjobs.NotificationRecordsCounts)
-	}
-
-	return registry
+type Collector struct {
+	activeAgents    *prometheus.Desc
+	activeUsers     *prometheus.Desc
+	userInfo        *prometheus.Desc
+	neo4jNodesCount *prometheus.Desc
 }
 
-type WorkerCollector struct {
-	tasks *prometheus.Desc
-}
-
-func newWorkerCollector() *WorkerCollector {
-	return &WorkerCollector{
-		tasks: prometheus.NewDesc(
-			"asynq_tasks",
-			"asynq tasks by status and queue",
-			[]string{"namespace", "queue", "task", "status"}, nil,
+func newCollector() *Collector {
+	return &Collector{
+		activeAgents: prometheus.NewDesc(
+			"active_agents_total",
+			"number of agents connected to console",
+			[]string{"node_type", "namespace"}, nil,
+		),
+		activeUsers: prometheus.NewDesc(
+			"active_users_total",
+			"number of users in the console",
+			[]string{"namespace"}, nil,
+		),
+		userInfo: prometheus.NewDesc(
+			"active_users_info",
+			"users info",
+			[]string{"namespace", "company"}, nil,
+		),
+		neo4jNodesCount: prometheus.NewDesc(
+			"neo4j_node_label_count",
+			"all neo4j nodes count",
+			[]string{"label", "namespace"}, nil,
 		),
 	}
 }
 
-func (collector *WorkerCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- collector.tasks
+func (collector *Collector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- collector.activeAgents
+	ch <- collector.activeUsers
+	ch <- collector.userInfo
+	ch <- collector.neo4jNodesCount
 }
 
-type tasks struct {
-	Tasks map[string]*status
-}
+func (collector *Collector) Collect(ch chan<- prometheus.Metric) {
+	ctx := directory.NewContextWithNameSpace(directory.NonSaaSDirKey)
+	ns := string(directory.NonSaaSDirKey)
 
-type status struct {
-	queue     string
-	active    int
-	pending   int
-	retry     int
-	archived  int
-	completed int
-}
-
-func newTaskState() *tasks {
-	return &tasks{
-		Tasks: make(map[string]*status),
-	}
-}
-
-func (ts *tasks) Inc(name string, queue string, state asynq.TaskState) {
-	s, found := ts.Tasks[name]
-	if !found {
-		s = &status{active: 0, pending: 0, retry: 0, queue: queue}
-		ts.Tasks[name] = s
-	}
-	switch state {
-	case asynq.TaskStateActive:
-		s.active += 1
-	case asynq.TaskStatePending:
-		s.pending += 1
-	case asynq.TaskStateRetry:
-		s.retry += 1
-	case asynq.TaskStateArchived:
-		s.archived += 1
-	case asynq.TaskStateCompleted:
-		s.completed += 1
-	}
-}
-
-func (collector *WorkerCollector) Collect(ch chan<- prometheus.Metric) {
-
-	for _, namespace := range directory.GetAllNamespaces() {
-
-		ctx := directory.NewContextWithNameSpace(namespace)
-		ns := string(namespace)
-
-		log := log.WithCtx(ctx)
-
-		log.Info().Msg("collect asynq tasks counts")
-
-		worker, err := directory.Worker(ctx)
-		if err != nil {
-			log.Error().Err(err).Msg("failed to get worker instance")
-			return
-		}
-
-		// get all the queues
-		queues, err := worker.Inspector().Queues()
-		if err != nil {
-			log.Error().Err(err).Msg("failed to get worker queues")
-			return
-		}
-
-		// track task status
-		status := newTaskState()
-
-		// page size for list tasks
-
-		pageSize := asynq.PageSize(5000)
-
-		for _, q := range queues {
-
-			var tasks []*asynq.TaskInfo
-			var err error
-
-			// active tasks
-			tasks, err = worker.Inspector().ListActiveTasks(q, pageSize)
-			if err != nil {
-				log.Error().Err(err).Msgf("failed to get active tasks from queue %s", q)
-			} else {
-				for _, task := range tasks {
-					status.Inc(task.Type, task.Queue, task.State)
-				}
-			}
-
-			// pending tasks
-			tasks, err = worker.Inspector().ListPendingTasks(q, pageSize)
-			if err != nil {
-				log.Error().Err(err).Msgf("failed to get pending tasks from queue %s", q)
-			} else {
-				for _, task := range tasks {
-					status.Inc(task.Type, task.Queue, task.State)
-				}
-			}
-
-			// retry tasks
-			tasks, err = worker.Inspector().ListRetryTasks(q, pageSize)
-			if err != nil {
-				log.Error().Err(err).Msgf("failed to get retry tasks from queue %s", q)
-			} else {
-				for _, task := range tasks {
-					status.Inc(task.Type, task.Queue, task.State)
-				}
-			}
-
-			// archived tasks
-			tasks, err = worker.Inspector().ListArchivedTasks(q, pageSize)
-			if err != nil {
-				log.Error().Err(err).Msgf("failed to get archived tasks from queue %s", q)
-			} else {
-				for _, task := range tasks {
-					status.Inc(task.Type, task.Queue, task.State)
-				}
-			}
-
-			// completed tasks
-			tasks, err = worker.Inspector().ListCompletedTasks(q, pageSize)
-			if err != nil {
-				log.Error().Err(err).Msgf("failed to get completed tasks from queue %s", q)
-			} else {
-				for _, task := range tasks {
-					status.Inc(task.Type, task.Queue, task.State)
-				}
-			}
-
-		}
-
-		for name, t := range status.Tasks {
-			ch <- prometheus.MustNewConstMetric(collector.tasks, prometheus.GaugeValue,
-				float64(t.active), ns, t.queue, name, "active")
-			ch <- prometheus.MustNewConstMetric(collector.tasks, prometheus.GaugeValue,
-				float64(t.pending), ns, t.queue, name, "pending")
-			ch <- prometheus.MustNewConstMetric(collector.tasks, prometheus.GaugeValue,
-				float64(t.retry), ns, t.queue, name, "retry")
-			ch <- prometheus.MustNewConstMetric(collector.tasks, prometheus.GaugeValue,
-				float64(t.archived), ns, t.queue, name, "archived")
-			ch <- prometheus.MustNewConstMetric(collector.tasks, prometheus.GaugeValue,
-				float64(t.completed), ns, t.queue, name, "completed")
-		}
-
+	// get number of agents connected
+	counts, err := reporters_search.CountNodes(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to fetch nodes count for metrics")
+	} else {
+		ch <- prometheus.MustNewConstMetric(collector.activeAgents, prometheus.GaugeValue,
+			float64(counts.CloudProviders), "cloud_provider", ns)
+		ch <- prometheus.MustNewConstMetric(collector.activeAgents, prometheus.GaugeValue,
+			float64(counts.Host), "host", ns)
+		ch <- prometheus.MustNewConstMetric(collector.activeAgents, prometheus.GaugeValue,
+			float64(counts.Container), "container", ns)
+		ch <- prometheus.MustNewConstMetric(collector.activeAgents, prometheus.GaugeValue,
+			float64(counts.ContainerImage), "container_image", ns)
+		ch <- prometheus.MustNewConstMetric(collector.activeAgents, prometheus.GaugeValue,
+			float64(counts.Pod), "pod", ns)
+		ch <- prometheus.MustNewConstMetric(collector.activeAgents, prometheus.GaugeValue,
+			float64(counts.KubernetesCluster), "kubernetes_cluster", ns)
+		ch <- prometheus.MustNewConstMetric(collector.activeAgents, prometheus.GaugeValue,
+			float64(counts.Namespace), "kubernetes_namespace", ns)
 	}
 
+	allNodes, err := reporters_search.CountAllNodeLabels(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to fetch all nodes count for metrics")
+	} else {
+		for k, v := range allNodes {
+			ch <- prometheus.MustNewConstMetric(collector.neo4jNodesCount, prometheus.GaugeValue,
+				float64(v), k, ns)
+		}
+	}
+
+	// get number of users
+	pgClient, err := directory.PostgresClient(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to fetch users count for metrics")
+		return
+	}
+
+	users, err := pgClient.GetUsers(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to fetch users count for metrics")
+	} else {
+		ch <- prometheus.MustNewConstMetric(collector.activeUsers, prometheus.GaugeValue, float64(len(users)), ns)
+		if len(users) > 0 {
+			ch <- prometheus.MustNewConstMetric(collector.userInfo, prometheus.GaugeValue, 1.0, ns, users[0].CompanyName)
+		}
+	}
+
+}
+
+func NewMetrics() *prometheus.Registry {
+	// prometheus metrics
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		newCollector(),
+	)
+
+	return registry
 }
