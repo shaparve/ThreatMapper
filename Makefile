@@ -1,24 +1,54 @@
-VERSION?=$(shell git describe --tags)
-GIT_COMMIT=$(shell git rev-parse HEAD)
-BUILD_TIME=$(shell date -u +%FT%TZ)
+#
+# DEEPFENCE.IO CONFIDENTIAL
+# _________________________
+#
+# [2014 - 2022] deepfence Inc
+# All Rights Reserved.
+#
+# NOTICE:  All information contained herein is, and remains
+# the property of deepfence.io and its suppliers,
+# if any.  The intellectual and technical concepts contained
+# herein are proprietary to deepfence.io
+# and its suppliers and may be covered by U.S. and Foreign Patents,
+# patents in process, and are protected by trade secret or copyright law.
+# Dissemination of this information or reproduction of this material
+# is strictly forbidden unless prior written permission is obtained
+# from deepfence.io.
+#
 
-all: deepfence_server
+.PHONY: discovery
 
-local: deepfence_server
+GOFLAGS += --ldflags
+GOFLAGS += '-extldflags "-static"'
+VERSION?=v`git rev-parse --short HEAD`
 
-image:
-	docker run --rm -i -e VERSION=${VERSION} -e GIT_COMMIT=${GIT_COMMIT} -e BUILD_TIME=${BUILD_TIME} -v $(ROOT_MAKEFILE_DIR):/src:rw -v /tmp/go:/go:rw $(IMAGE_REPOSITORY)/deepfence_builder_ce:$(DF_IMG_TAG) bash -c 'cd /src/deepfence_server && make deepfence_server'
-	docker build -f ./Dockerfile -t $(IMAGE_REPOSITORY)/deepfence_server_ce:$(DF_IMG_TAG) ..
+LN = ln
+MKDIR = mkdir
+CD = cd
+CP = cp
 
-vendor: go.mod $(shell find ../deepfence_utils -path ../deepfence_utils/vendor -prune -o -name '*.go')
-	go mod tidy -v
-	go mod vendor
+gocode:
+	echo "Building go binary for cloud metadata instance id..."
+	($(CD) tools/apache/deepfence/df-utils/get_cloud_instance_id && CGO_ENABLED=0 go build -o getCloudInstanceId $(GOFLAGS) .)
 
-deepfence_server: vendor $(shell find . -path ./vendor -prune -o -name '*.go')
-	go build -buildvcs=false -ldflags="-s -w -X github.com/deepfence/ThreatMapper/deepfence_server/pkg/constants.Version=${VERSION} -X github.com/deepfence/ThreatMapper/deepfence_server/pkg/constants.Commit=${GIT_COMMIT} -X github.com/deepfence/ThreatMapper/deepfence_server/pkg/constants.BuildTime=${BUILD_TIME}"
+install:
+
+tools/apache/scope/vendor: tools/apache/scope/go.mod $(shell find ../deepfence_utils -path ../deepfence_utils/vendor -prune -o -name '*.go') $(shell find ./tools/apache/scope -path ./tools/apache/scope/vendor -prune -o -name '*.go')
+	($(CD) tools/apache/scope && go mod tidy -v)
+	($(CD) tools/apache/scope && go mod vendor)
+
+discovery: tools/apache/scope/vendor
+	($(CD) tools/apache/scope && \
+		env GOGC=off \
+		CGO_ENABLED=1 \
+		go build -buildvcs=false \
+		-ldflags "-X main.version=${VERSION} -X github.com/weaveworks/scope/probe/host.agentCommitID=${VERSION} -X github.com/weaveworks/scope/probe/host.agentBuildTime=$(shell date +"%s%d%m%y") -s -w -extldflags=-static"\
+		-tags 'netgo osusergo unsafe' \
+		-o docker/discovery \
+		./prog)
 
 clean:
-	-rm deepfence_server
-	-rm -rf ./vendor
-
-.PHONY: all clean image local
+	-$(RM) tools/apache/deepfence/df-utils/getCloudInstanceId
+	-$(RM) tools/apache/scope/docker/discovery
+	-(cd plugins && make clean)
+	-$(RM) -rf tools/apache/scope/vendor
