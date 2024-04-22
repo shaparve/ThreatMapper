@@ -1,11 +1,6 @@
-**/.git
-**/.github
-**/.pnpm-store
-**/.vscode
-**/.cache
-**/node_modules
-**/scope.tar
-**/cloud-agent.tar
-**/docs
-images
-pentesting-reports
+node_modules
+
+packages/*/*/node_modules
+apps/*/*/node_modules
+
+packages/ui-components/dist

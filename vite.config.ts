@@ -1,28 +1,62 @@
 /// <reference types="vitest" />
-
+/// <reference types="vite/client" />
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import react from '@vitejs/plugin-react';
 import { visualizer } from 'rollup-plugin-visualizer';
-import { defineConfig, PluginOption, UserConfig } from 'vite';
-import dts from 'vite-plugin-dts';
+import { defineConfig, loadEnv } from 'vite';
 import { configDefaults } from 'vitest/config';
-
-import { peerDependencies } from './package.json';
+import webfontDownload from 'vite-plugin-webfont-dl';
 
 const current = fileURLToPath(import.meta.url);
 const root = path.dirname(current);
 
+const matomoPlugin = (enable: string) => {
+  if (enable?.trim() === 'true') {
+    return {
+      name: 'analytics-tracking',
+      transformIndexHtml(html) {
+        return html.replace(
+          /<analytics-tracking>(.*?)<\/analytics-tracking>/,
+          `<script>
+          var _paq = (window._paq = window._paq || []);
+          /* tracker methods like "setCustomDimension" should be called before "trackPageView" */
+          _paq.push(['trackPageView']);
+          _paq.push(['enableLinkTracking']);
+          (function () {
+            var u = '//analytics.deepfence.io/';
+            _paq.push(['setTrackerUrl', u + 'matomo.php']);
+            _paq.push(['setSiteId', '1']);
+            var d = document,
+              g = d.createElement('script'),
+              s = d.getElementsByTagName('script')[0];
+            g.async = true;
+            g.src = u + 'matomo.js';
+            s.parentNode.insertBefore(g, s);
+          })();
+        </script>`,
+        );
+      },
+    };
+  }
+  return {
+    name: 'analytics-tracking',
+    transformIndexHtml(html) {
+      return html.replace(/<analytics-tracking>(.*?)<\/analytics-tracking>/, '');
+    },
+  };
+};
+
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
+  const viteEnv = loadEnv(mode, '.');
   return {
     plugins: [
       react(),
-      dts({
-        insertTypesEntry: true,
-      }),
-      ...(mode === 'production' ? [visualizer() as unknown as PluginOption] : []),
+      webfontDownload(),
+      matomoPlugin(process.env.ENABLE_ANALYTICS),
+      ...(mode === 'production' ? [visualizer()] : []),
     ],
     test: {
       includeSource: ['src/**/*.test.{ts, tsx}'],
@@ -43,19 +77,21 @@ export default defineConfig(({ mode }) => {
       include: ['tailwind-preset'],
     },
     build: {
-      sourcemap: true,
-      lib: {
-        entry: path.resolve(root, 'src/main.ts'),
-        formats: ['es'],
-        name: 'ui-components',
-        fileName: (format) => `index.${format}.js`,
-      },
-      rollupOptions: {
-        external: [...Object.keys(peerDependencies)],
-      },
       // https://github.com/vitejs/vite/issues/5668
       commonjsOptions: {
         include: [/tailwind-preset/, /node_modules/],
+      },
+    },
+    server: {
+      host: true,
+      port: 5050,
+      proxy: {
+        '^/deepfence/.*': {
+          target: viteEnv.VITE_DEV_API_BASE_URL,
+          changeOrigin: true,
+          secure: false,
+          proxyTimeout: 300000,
+        },
       },
     },
     resolve: {
@@ -63,5 +99,5 @@ export default defineConfig(({ mode }) => {
         '@': path.resolve(root, './src'),
       },
     },
-  } satisfies UserConfig;
+  };
 });
